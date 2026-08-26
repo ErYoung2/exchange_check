@@ -1,0 +1,1 @@
+check exchange realtime rates HKD/CNY and USD/CNY
