@@ -27,7 +27,7 @@ var cache RateCache
 
 // 从外部 API 更新汇率
 func updateRates() {
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get("https://open.er-api.com/v6/latest/USD")
 	if err != nil {
 		log.Printf("[错误] 获取汇率失败: %v", err)
