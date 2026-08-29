@@ -8,99 +8,124 @@ import (
 	"time"
 )
 
-// API 响应结构
+// 1. 第三方 API 返回的 JSON 结构体
 type ExchangeAPIResponse struct {
 	Rates          map[string]float64 `json:"rates"`
 	TimeLastUpdate string             `json:"time_last_update_utc"`
 }
 
-// 内存中保存的汇率缓存数据
-type RateCache struct {
-	sync.RWMutex
-	USDCNY     float64 `json:"usd_cny"`
-	HKDCNY     float64 `json:"hkd_cny"`
-	UpdateTime string  `json:"update_time"`
-	FetchTime  string  `json:"fetch_time"`
+// 2. 本地缓存并输出给前端的 JSON 结构体
+type ExchangeCache struct {
+	USDCNY    float64   `json:"usd_cny"`
+	HKDCNY    float64   `json:"hkd_cny"`
+	FetchTime time.Time `json:"fetch_time"`
 }
 
-var cache RateCache
+var (
+	cache ExchangeCache
+	mu    sync.RWMutex
+)
 
-// 从外部 API 更新汇率
-func updateRates() {
-	client := &http.Client{Timeout: 5 * time.Second}
+// 兜底逻辑：防止第三方 API 失败时返回全 0
+func useFallbackRates() {
+	mu.Lock()
+	defer mu.Unlock()
+	if cache.USDCNY == 0 {
+		cache = ExchangeCache{
+			USDCNY:    7.2350,
+			HKDCNY:    0.9250,
+			FetchTime: time.Now(),
+		}
+		log.Println("[INFO] 启用兜底汇率数据成功")
+	}
+}
+
+// 从第三方 API 获取实时汇率
+func fetchRates() {
+	// 设置 5 秒严格超时，防止请求挂起
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+
 	resp, err := client.Get("https://open.er-api.com/v6/latest/USD")
 	if err != nil {
-		log.Printf("[错误] 获取汇率失败: %v", err)
+		log.Printf("[ERROR] 请求第三方 API 失败: %v", err)
+		useFallbackRates()
 		return
 	}
 	defer resp.Body.Close()
 
 	var data ExchangeAPIResponse
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		log.Printf("[错误] 解析 JSON 失败: %v", err)
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil || len(data.Rates) == 0 {
+		log.Printf("[ERROR] 解析第三方 API 数据失败: %v", err)
+		useFallbackRates()
 		return
 	}
 
-	cnyRate, hasCNY := data.Rates["CNY"]
-	hkdRate, hasHKD := data.Rates["HKD"]
+	cnyRate := data.Rates["CNY"]
+	hkdRate := data.Rates["HKD"]
 
-	if !hasCNY || !hasHKD {
-		log.Printf("[错误] 汇率数据不完整")
+	if cnyRate == 0 || hkdRate == 0 {
+		log.Println("[ERROR] 第三方 API 返回汇率为 0")
+		useFallbackRates()
 		return
 	}
 
-	// 加锁更新内存缓存
-	cache.Lock()
-	cache.USDCNY = cnyRate
-	cache.HKDCNY = cnyRate / hkdRate
-	cache.UpdateTime = data.TimeLastUpdate
-	cache.FetchTime = time.Now().Format("2006-01-02 15:04:05")
-	cache.Unlock()
+	mu.Lock()
+	cache = ExchangeCache{
+		USDCNY:    cnyRate,
+		HKDCNY:    cnyRate / hkdRate,
+		FetchTime: time.Now(),
+	}
+	mu.Unlock()
 
-	log.Printf("[成功] 汇率已更新 | USD/CNY: %.4f | HKD/CNY: %.4f", cache.USDCNY, cache.HKDCNY)
+	log.Printf("[SUCCESS] 汇率拉取成功: USD/CNY=%.4f, HKD/CNY=%.4f", cnyRate, cnyRate/hkdRate)
 }
 
-// 启动 5 分钟定时任务
-func startCronJob() {
-	// 服务启动时立即拉取一次
-	updateRates()
-
-	ticker := time.NewTicker(5 * time.Minute)
-	go func() {
-		for range ticker.C {
-			updateRates()
-		}
-	}()
-}
-
-// 提供给小程序的 HTTP 接口
-func ratesHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	// 允许跨域（方便开发调试）
+// 处理前端请求的 HTTP Handler
+func handleRates(w http.ResponseWriter, r *http.Request) {
+	// 设置跨域与数据格式
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
 
-	cache.RLock()
-	defer cache.RUnlock()
+	// 禁用缓存，防止前端收到 304 导致数据不更新
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
 
-	if cache.USDCNY == 0 {
-		http.Error(w, `{"error": "数据尚未准备就绪"}`, http.StatusServiceUnavailable)
-		return
+	mu.RLock()
+	currentCache := cache
+	mu.RUnlock()
+
+	// 如果数据尚未初始化，自动触发一次兜底
+	if currentCache.USDCNY == 0 {
+		useFallbackRates()
+		mu.RLock()
+		currentCache = cache
+		mu.RUnlock()
 	}
 
-	json.NewEncoder(w).Encode(cache)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(currentCache)
 }
 
 func main() {
-	// 初始化 Go module (若未初始化)
-	// 启动定时拉取任务
-	startCronJob()
+	// 1. 启动时异步拉取一次汇率（非阻塞）
+	go fetchRates()
 
-	// 注册 API 路由
-	http.HandleFunc("/api/rates", ratesHandler)
+	// 2. 5 分钟定时器刷新数据
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		for range ticker.C {
+			fetchRates()
+		}
+	}()
 
-	port := ":8080"
-	log.Printf("服务启动在端口 %s", port)
-	if err := http.ListenAndServe(port, nil); err != nil {
-		log.Fatalf("启动失败: %v", err)
+	// 3. 注册路由并启动服务
+	http.HandleFunc("/api/rates", handleRates)
+
+	log.Println("Server running on :8080...")
+	if err := http.ListenAndServe("0.0.0.0:8080", nil); err != nil {
+		log.Fatal(err)
 	}
 }
