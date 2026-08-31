@@ -1,4 +1,5 @@
 #!/bin/bash
+docker stop exchange_check_app
 docker rm exchange_check_app && docker rmi exchange_check_app:latest
 docker build -t exchange_check_app:latest .
 docker run -d \
